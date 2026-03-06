@@ -34,13 +34,19 @@
   - [10.3 Java/Android 图像推理完整示例](#103-javaandroid-图像推理完整示例)
   - [10.4 Android 项目集成指南](#104-android-项目集成指南)
 - [11. ONNX 导出与跨平台部署](#11-onnx-导出与跨平台部署)
-- [12. 调用流程图](#12-调用流程图)
-  - [12.1 推理调用流程](#121-推理调用流程)
-  - [12.2 训练调用流程](#122-训练调用流程)
-- [13. 关键设计模式与工程决策](#13-关键设计模式与工程决策)
-- [14. 预训练模型一览](#14-预训练模型一览)
-- [15. 测试体系](#15-测试体系)
-- [16. 总结](#16-总结)
+- [12. OpenVINO 集成与优化](#12-openvino-集成与优化)
+  - [12.1 概述](#121-概述)
+  - [12.2 模型转换流程](#122-模型转换流程)
+  - [12.3 Python API (OpenVINO Runtime)](#123-python-api-openvino-runtime)
+  - [12.4 C++ API (OpenVINO Runtime)](#124-c-api-openvino-runtime)
+  - [12.5 性能优势与适用场景](#125-性能优势与适用场景)
+- [13. 调用流程图](#13-调用流程图)
+  - [13.1 推理调用流程](#131-推理调用流程)
+  - [13.2 训练调用流程](#132-训练调用流程)
+- [14. 关键设计模式与工程决策](#14-关键设计模式与工程决策)
+- [15. 预训练模型一览](#15-预训练模型一览)
+- [16. 测试体系](#16-测试体系)
+- [17. 总结](#17-总结)
 
 ---
 
@@ -1512,14 +1518,340 @@ with torch.no_grad():
 | Windows/Linux/macOS (GPU) | NCNN + Vulkan | `.param` + `.bin` | [Real-ESRGAN-ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan) |
 | Android (GPU) | NCNN + Vulkan | `.param` + `.bin` | [RealSR-NCNN-Android](https://github.com/tumuyan/RealSR-NCNN-Android) |
 | 通用 (GPU) | ONNX Runtime | `.onnx` | `scripts/pytorch2onnx.py` |
+| Intel CPU/GPU/NPU | OpenVINO | `.xml` + `.bin` | ONNX → OpenVINO (详见§12) |
 | NVIDIA GPU | TensorRT | `.engine` | ONNX → TensorRT |
 | Apple 设备 | CoreML | `.mlmodel` | ONNX → CoreML |
 
 ---
 
-## 12. 调用流程图
+## 12. OpenVINO 集成与优化
 
-### 12.1 推理调用流程
+### 12.1 概述
+
+[OpenVINO](https://github.com/openvinotoolkit/openvino)（Open Visual Inference and Neural Network Optimization）是 Intel 开源的推理优化工具套件，专为 Intel CPU、集成/独立 GPU 及 NPU 加速器优化。Real-ESRGAN 模型可通过 **ONNX → OpenVINO IR** 转换后部署，在 Intel 平台上获得显著的推理加速。
+
+**Real-ESRGAN 官方仓库本身不包含 OpenVINO 集成代码**，但社区已有成熟的集成方案：
+
+| 项目 | 语言 | 说明 |
+|------|------|------|
+| [RealESRGAN-on-OpenVINO](https://github.com/Pix-10/RealESRGAN-on-OpenVINO) | Python | OpenVINO Runtime Python API，支持动态输入、CPU/GPU 推理 |
+| [Real-ESRGAN-For-Intel-GPU](https://github.com/nekofoo/Real-ESRGAN-For-Intel-GPU) | C++ | OpenVINO C++ API，针对 Intel GPU 优化，比 NCNN-Vulkan 快约5倍 |
+| [vs-mlrt](https://github.com/AmusementClub/vs-mlrt) | C++ | VapourSynth 视频处理插件，同时支持 OpenVINO/TensorRT/NCNN 多后端 |
+
+**技术架构**:
+
+```
+                    Real-ESRGAN 模型转换与 OpenVINO 部署流程
+┌─────────────┐     ┌─────────────┐     ┌──────────────────┐
+│  PyTorch    │     │    ONNX     │     │   OpenVINO IR    │
+│  .pth 权重  │ ──→ │  .onnx 模型 │ ──→ │  .xml + .bin     │
+│             │     │             │     │                  │
+│ pytorch2    │     │ ov.convert  │     │  ov.Core()       │
+│ onnx.py     │     │ _model()    │     │  .compile_model()│
+└─────────────┘     └─────────────┘     └──────────────────┘
+                                               │
+                              ┌────────────────┼────────────────┐
+                              ▼                ▼                ▼
+                         Intel CPU        Intel GPU         Intel NPU
+                        (优化的推理)    (集成/独立显卡)    (AI 加速器)
+```
+
+### 12.2 模型转换流程
+
+**第 1 步: PyTorch → ONNX**（使用本仓库 `scripts/pytorch2onnx.py`）:
+
+```python
+import torch
+from basicsr.archs.rrdbnet_arch import RRDBNet
+
+model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                num_block=23, num_grow_ch=32, scale=4)
+model.load_state_dict(torch.load('RealESRGAN_x4plus.pth')['params_ema'])
+model.eval()
+
+x = torch.rand(1, 3, 64, 64)
+with torch.no_grad():
+    torch.onnx.export(model, x, 'realesrgan-x4.onnx',
+                      opset_version=11, export_params=True)
+```
+
+**第 2 步: ONNX → OpenVINO IR**:
+
+```python
+import openvino as ov
+
+ov_model = ov.convert_model('realesrgan-x4.onnx')
+ov.save_model(ov_model, 'realesrgan-x4.xml')
+# 生成 realesrgan-x4.xml (模型结构) + realesrgan-x4.bin (权重)
+```
+
+也可使用命令行工具:
+
+```bash
+# 安装 OpenVINO 开发工具
+pip install openvino-dev
+
+# 转换模型
+ovc realesrgan-x4.onnx --output_model realesrgan-x4.xml
+```
+
+### 12.3 Python API (OpenVINO Runtime)
+
+以下是使用 OpenVINO Python API 进行 Real-ESRGAN 图像推理的完整示例:
+
+```python
+import cv2
+import numpy as np
+import openvino.runtime as ov
+
+class RealESRGAN_OpenVINO:
+    """基于 OpenVINO 的 Real-ESRGAN 推理引擎"""
+
+    def __init__(self, model_path, device="CPU"):
+        """
+        初始化 OpenVINO 推理引擎
+
+        参数:
+            model_path: OpenVINO IR 模型路径 (.xml 文件)
+            device: 推理设备 ("CPU", "GPU", "NPU", "AUTO")
+        """
+        # 初始化 OpenVINO Core
+        self.core = ov.Core()
+
+        # 读取模型
+        model = self.core.read_model(model_path)
+
+        # 设置动态输入 (支持任意分辨率)
+        model.reshape([1, 3, -1, -1])
+
+        # 编译模型到指定设备
+        self.compiled_model = self.core.compile_model(model, device_name=device)
+        self.infer_request = self.compiled_model.create_infer_request()
+
+        # 获取输入/输出名称
+        self.input_name = self.compiled_model.input().get_any_name()
+        self.output_tensor = self.compiled_model.output()
+
+    def enhance(self, img):
+        """
+        执行超分辨率推理
+
+        参数:
+            img: 输入图像 (BGR, uint8, HWC 格式)
+        返回:
+            超分辨率后的图像 (BGR, uint8, HWC 格式)
+        """
+        # 预处理: BGR→RGB, 归一化, HWC→NCHW
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_float = img_rgb.astype(np.float32) / 255.0
+        img_nchw = np.transpose(img_float, (2, 0, 1))
+        img_batch = np.expand_dims(img_nchw, axis=0)
+
+        # 执行推理
+        result = self.infer_request.infer(
+            {self.input_name: img_batch}
+        )[self.output_tensor]
+
+        # 后处理: NCHW→HWC, 反归一化, RGB→BGR
+        output = result[0]
+        output = np.clip(output, 0, 1) * 255.0
+        output = output.astype(np.uint8)
+        output = np.transpose(output, (1, 2, 0))
+        output_bgr = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
+        return output_bgr
+
+
+# === 使用示例 ===
+if __name__ == "__main__":
+    # 初始化推理引擎
+    # device 可选: "CPU" / "GPU" (Intel 集成/独立显卡) / "AUTO" (自动选择)
+    upscaler = RealESRGAN_OpenVINO(
+        model_path="realesrgan-x4.xml",
+        device="AUTO"
+    )
+
+    # 读取输入图像
+    img = cv2.imread("input.jpg")
+
+    # 执行超分辨率
+    result = upscaler.enhance(img)
+
+    # 保存结果
+    cv2.imwrite("output_openvino.png", result)
+    print(f"超分完成: {img.shape[:2]} → {result.shape[:2]}")
+```
+
+**依赖安装**:
+
+```bash
+pip install openvino opencv-python numpy
+```
+
+### 12.4 C++ API (OpenVINO Runtime)
+
+以下是使用 OpenVINO C++ API 进行 Real-ESRGAN 推理的完整示例（参考 [Real-ESRGAN-For-Intel-GPU](https://github.com/nekofoo/Real-ESRGAN-For-Intel-GPU)）:
+
+```cpp
+#include "openvino/openvino.hpp"
+#include "opencv2/opencv.hpp"
+#include <iostream>
+#include <chrono>
+
+class RealESRGAN_OpenVINO {
+private:
+    ov::CompiledModel compiled_model;
+    ov::InferRequest infer_request;
+    ov::Output<const ov::Node> output_port;
+
+public:
+    /**
+     * 构造函数: 加载并编译 OpenVINO 模型
+     * @param model_path  模型文件路径 (.xml)
+     * @param device      推理设备 ("CPU", "GPU", "AUTO")
+     */
+    RealESRGAN_OpenVINO(const std::string& model_path,
+                         const std::string& device = "AUTO") {
+        ov::Core core;
+
+        // 启用模型缓存 (首次编译后缓存, 后续加载更快)
+        core.set_property(ov::cache_dir("model_cache/"));
+
+        // 编译模型
+        compiled_model = core.compile_model(model_path, device);
+        output_port = compiled_model.output();
+        infer_request = compiled_model.create_infer_request();
+    }
+
+    /**
+     * 执行超分辨率推理
+     * @param image  输入图像 (OpenCV BGR Mat)
+     * @return       超分辨率后的图像 (OpenCV BGR Mat)
+     */
+    cv::Mat enhance(const cv::Mat& image) {
+        auto t_start = std::chrono::high_resolution_clock::now();
+
+        // 预处理: BGR→RGB, 归一化为 [0,1], HWC→NCHW
+        cv::Mat blob = cv::dnn::blobFromImage(
+            image, 1.0 / 255.0, image.size(),
+            cv::Scalar(0, 0, 0), true, false);
+
+        // 创建输入 Tensor
+        ov::Shape input_shape = {1, 3,
+            static_cast<size_t>(image.rows),
+            static_cast<size_t>(image.cols)};
+        ov::Tensor input_tensor(ov::element::f32, input_shape, blob.data);
+
+        // 执行推理
+        infer_request.set_input_tensor(input_tensor);
+        infer_request.infer();
+        auto output = infer_request.get_output_tensor();
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            t_end - t_start);
+        std::cout << "推理耗时: " << duration.count() / 1000.0
+                  << " 秒" << std::endl;
+
+        // 后处理: NCHW→HWC, 反归一化, RGB→BGR
+        auto shape = output.get_shape();
+        std::vector<int> sizes = {1, (int)shape[1],
+                                  (int)shape[2], (int)shape[3]};
+        cv::Mat out_blob(4, sizes.data(), CV_32F, output.data<float>());
+
+        std::vector<cv::Mat> images;
+        cv::dnn::imagesFromBlob(out_blob, images);
+
+        cv::Mat result;
+        (images[0] * 255.0).convertTo(result, CV_8U);
+        cv::cvtColor(result, result, cv::COLOR_RGB2BGR);
+
+        return result;
+    }
+};
+
+// === 使用示例 ===
+int main(int argc, char* argv[]) {
+    // 读取输入图像
+    cv::Mat img = cv::imread("input.jpg");
+    if (img.empty()) {
+        std::cerr << "无法读取图像!" << std::endl;
+        return 1;
+    }
+
+    // 创建推理引擎 (自动选择最佳设备)
+    RealESRGAN_OpenVINO upscaler("realesrgan-x4.xml", "AUTO");
+
+    // 执行超分辨率
+    cv::Mat result = upscaler.enhance(img);
+
+    // 保存结果
+    cv::imwrite("output_openvino.png", result);
+    std::cout << "超分完成: " << img.size() << " → "
+              << result.size() << std::endl;
+    return 0;
+}
+```
+
+**CMake 构建配置**:
+
+```cmake
+cmake_minimum_required(VERSION 3.10)
+project(realesrgan-openvino)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(OpenCV REQUIRED)
+find_package(OpenVINO REQUIRED)
+
+add_executable(realesrgan-ov main.cpp)
+target_link_libraries(realesrgan-ov PRIVATE openvino::runtime ${OpenCV_LIBS})
+```
+
+**编译与运行**:
+
+```bash
+# 安装依赖
+# Ubuntu: sudo apt install libopenvino-dev libopencv-dev
+# Windows: 从 Intel 官网下载 OpenVINO Runtime
+
+mkdir build && cd build
+cmake ..
+cmake --build . --config Release
+
+./realesrgan-ov -i input.jpg -o output.png
+```
+
+### 12.5 性能优势与适用场景
+
+**OpenVINO vs 其他推理框架**:
+
+| 特性 | OpenVINO | NCNN-Vulkan | PyTorch | ONNX Runtime |
+|------|----------|-------------|---------|--------------|
+| Intel CPU 优化 | ✅ 深度优化 (AVX-512/AMX) | ❌ | ⚠️ 一般 | ⚠️ 一般 |
+| Intel GPU 加速 | ✅ 集成/独立 GPU | ✅ Vulkan | ❌ | ⚠️ 有限 |
+| Intel NPU 支持 | ✅ | ❌ | ❌ | ❌ |
+| 模型缓存 | ✅ 编译缓存加速 | ❌ | ❌ | ❌ |
+| 动态形状输入 | ✅ | ⚠️ 有限 | ✅ | ✅ |
+| 量化优化 (INT8) | ✅ NNCF 工具 | ⚠️ | ❌ | ⚠️ |
+| 跨平台 | Intel 平台为主 | 全平台 | 全平台 | 全平台 |
+
+**适用场景**:
+
+- **Intel CPU 服务器部署**: OpenVINO 对 Intel Xeon 有深度优化（AVX-512、AMX 指令集），适合无 NVIDIA GPU 的服务端推理
+- **Intel 集成/独立 GPU**: 特别是 Intel Arc 独立显卡，OpenVINO 可充分利用其计算能力
+- **边缘设备**: Intel NUC、工控机等带 Intel 集成 GPU 的设备
+- **INT8 量化加速**: 可使用 [NNCF](https://github.com/openvinotoolkit/nncf) 进行模型量化，以牺牲少量精度换取更快的推理速度
+
+**性能参考** (来源: [Real-ESRGAN-For-Intel-GPU](https://github.com/nekofoo/Real-ESRGAN-For-Intel-GPU)):
+
+在 Intel GPU 上，OpenVINO 实现相比 NCNN-Vulkan 实现可达到约 **5 倍**的推理速度提升。
+
+---
+
+## 13. 调用流程图
+
+### 13.1 推理调用流程
 
 ```
 用户命令: python inference_realesrgan.py -i input.jpg -s 4
@@ -1566,7 +1898,7 @@ with torch.no_grad():
     └── 完成
 ```
 
-### 12.2 训练调用流程
+### 13.2 训练调用流程
 
 ```
 用户命令: python -m realesrgan.train -opt options/train_realesrgan_x4plus.yml
@@ -1621,9 +1953,9 @@ with torch.no_grad():
 
 ---
 
-## 13. 关键设计模式与工程决策
+## 14. 关键设计模式与工程决策
 
-### 13.1 注册机制 (Registry Pattern)
+### 14.1 注册机制 (Registry Pattern)
 
 通过 BasicSR 的注册机制实现组件的松耦合：
 
@@ -1640,7 +1972,7 @@ class MyNewArch(nn.Module): ...
 
 **优势**: 添加新组件无需修改任何现有代码，只需创建文件并注册。
 
-### 13.2 在线退化合成 (Online Degradation Synthesis)
+### 14.2 在线退化合成 (Online Degradation Synthesis)
 
 退化图像在训练时在线生成，而非预先准备：
 
@@ -1650,7 +1982,7 @@ class MyNewArch(nn.Module): ...
 - 退化参数可随时调整
 - 队列机制进一步增加多样性
 
-### 13.3 分块推理 (Tile-based Inference)
+### 14.3 分块推理 (Tile-based Inference)
 
 对于大图像，分块处理避免 GPU 显存溢出：
 
@@ -1668,7 +2000,7 @@ class MyNewArch(nn.Module): ...
 
 每块独立处理后加权融合边界区域，消除接缝。
 
-### 13.4 深度网络插值 (Deep Network Interpolation, DNI)
+### 14.4 深度网络插值 (Deep Network Interpolation, DNI)
 
 通过混合两个模型的权重实现连续可调的效果：
 
@@ -1680,7 +2012,7 @@ for k in net_a.keys():
 
 应用场景: `realesr-general-x4v3` 模型的降噪强度控制。
 
-### 13.5 生产者-消费者模式 (Producer-Consumer Pattern)
+### 14.5 生产者-消费者模式 (Producer-Consumer Pattern)
 
 视频推理中使用多线程流水线：
 
@@ -1694,7 +2026,7 @@ IOConsumer (消费者线程)
 
 三个阶段并行执行，最大化吞吐量。
 
-### 13.6 两阶段训练策略
+### 14.6 两阶段训练策略
 
 ```
 阶段一 (PSNR导向):
@@ -1708,7 +2040,7 @@ IOConsumer (消费者线程)
 
 ---
 
-## 14. 预训练模型一览
+## 15. 预训练模型一览
 
 | 模型名称 | 架构 | 倍数 | 参数量 | 用途 |
 |----------|------|------|--------|------|
@@ -1721,11 +2053,11 @@ IOConsumer (消费者线程)
 
 ---
 
-## 15. 测试体系
+## 16. 测试体系
 
 项目包含 4 个测试文件，覆盖核心功能：
 
-### 15.1 test_dataset.py
+### 16.1 test_dataset.py
 
 - **`test_realesrgan_dataset()`**: 测试在线退化数据集
   - 验证磁盘和 LMDB 后端
@@ -1738,13 +2070,13 @@ IOConsumer (消费者线程)
   - 检查归一化参数
   - 验证输出形状 (gt: 3×128×128, lq: 3×32×32)
 
-### 15.2 test_discriminator_arch.py
+### 16.2 test_discriminator_arch.py
 
 - **`test_unetdiscriminatorsn()`**: 测试判别器
   - CPU 和 GPU 前向传播
   - 输入 (1,3,32,32) → 输出 (1,1,32,32)
 
-### 15.3 test_model.py
+### 16.3 test_model.py
 
 - **`test_realesrnet_model()`**: 测试回归模型
   - 验证组件类型 (RRDBNet, L1Loss, Adam)
@@ -1755,7 +2087,7 @@ IOConsumer (消费者线程)
   - 验证 3 种损失类型
   - 测试 optimize_parameters() 输出
 
-### 15.4 test_utils.py
+### 16.4 test_utils.py
 
 - **`test_realesrganer()`**: 测试推理引擎
   - 测试 pre_process, tile_process, enhance
@@ -1764,7 +2096,7 @@ IOConsumer (消费者线程)
 
 ---
 
-## 16. 总结
+## 17. 总结
 
 ### 架构优势
 
