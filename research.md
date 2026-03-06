@@ -22,13 +22,25 @@
   - [7.3 训练配置文件](#73-训练配置文件)
   - [7.4 训练策略](#74-训练策略)
 - [8. API 接口详解](#8-api-接口详解)
-- [9. 调用流程图](#9-调用流程图)
-  - [9.1 推理调用流程](#91-推理调用流程)
-  - [9.2 训练调用流程](#92-训练调用流程)
-- [10. 关键设计模式与工程决策](#10-关键设计模式与工程决策)
-- [11. 预训练模型一览](#11-预训练模型一览)
-- [12. 测试体系](#12-测试体系)
-- [13. 总结](#13-总结)
+- [9. C++ API 详解 (NCNN-Vulkan)](#9-c-api-详解-ncnn-vulkan)
+  - [9.1 概述与架构](#91-概述与架构)
+  - [9.2 C++ 类接口](#92-c-类接口)
+  - [9.3 C++ 图像推理完整示例](#93-c-图像推理完整示例)
+  - [9.4 编译与构建](#94-编译与构建)
+  - [9.5 命令行工具使用](#95-命令行工具使用)
+- [10. Java/Android API 详解 (NCNN-Android)](#10-javaandroid-api-详解-ncnn-android)
+  - [10.1 概述与架构](#101-概述与架构)
+  - [10.2 JNI 桥接层](#102-jni-桥接层)
+  - [10.3 Java/Android 图像推理完整示例](#103-javaandroid-图像推理完整示例)
+  - [10.4 Android 项目集成指南](#104-android-项目集成指南)
+- [11. ONNX 导出与跨平台部署](#11-onnx-导出与跨平台部署)
+- [12. 调用流程图](#12-调用流程图)
+  - [12.1 推理调用流程](#121-推理调用流程)
+  - [12.2 训练调用流程](#122-训练调用流程)
+- [13. 关键设计模式与工程决策](#13-关键设计模式与工程决策)
+- [14. 预训练模型一览](#14-预训练模型一览)
+- [15. 测试体系](#15-测试体系)
+- [16. 总结](#16-总结)
 
 ---
 
@@ -888,9 +900,623 @@ python -m realesrgan.train -opt options/train_realesrgan_x4plus.yml \
 
 ---
 
-## 9. 调用流程图
+## 9. C++ API 详解 (NCNN-Vulkan)
 
-### 9.1 推理调用流程
+### 9.1 概述与架构
+
+Real-ESRGAN 官方提供了基于 [NCNN](https://github.com/Tencent/ncnn) 框架的 C++ 实现，位于独立仓库 [Real-ESRGAN-ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan)。该实现使用 Vulkan GPU 加速，支持 Windows、Linux、macOS 三大平台，**无需安装 CUDA 或 PyTorch 环境**。
+
+**C++ 实现的技术栈**:
+
+```
+┌──────────────────────────────────┐
+│     应用层: main.cpp              │
+│     (命令行工具, 多线程任务调度)     │
+├──────────────────────────────────┤
+│     核心层: realesrgan.h/cpp      │
+│     (模型加载, 分块推理, 前后处理)   │
+├──────────────────────────────────┤
+│     框架层: NCNN                  │
+│     (神经网络推理, Vulkan GPU加速)  │
+├──────────────────────────────────┤
+│     图像I/O: stb_image / WIC      │
+│     (跨平台图像编解码)              │
+└──────────────────────────────────┘
+```
+
+**与 Python 版本的对应关系**:
+
+| Python (本仓库) | C++ (ncnn-vulkan) |
+|-----------------|-------------------|
+| `RealESRGANer` 类 | `RealESRGAN` 类 |
+| `RealESRGANer.enhance()` | `RealESRGAN::process()` |
+| `RealESRGANer.tile_process()` | 内置于 `process()` 中 |
+| `.pth` 模型权重 | `.param` + `.bin` NCNN模型 |
+| PyTorch + CUDA | NCNN + Vulkan |
+
+### 9.2 C++ 类接口
+
+核心 C++ 类定义于 `src/realesrgan.h`：
+
+```cpp
+#include "net.h"    // ncnn
+#include "gpu.h"    // ncnn
+#include "layer.h"  // ncnn
+
+class RealESRGAN
+{
+public:
+    // 构造函数
+    // gpuid: GPU设备ID (-1表示CPU)
+    // tta_mode: 是否启用TTA (Test-Time Augmentation) 模式
+    RealESRGAN(int gpuid, bool tta_mode = false);
+    ~RealESRGAN();
+
+    // 加载NCNN模型
+    // parampath: .param 模型结构文件路径
+    // modelpath: .bin 模型权重文件路径
+    // 返回: 0=成功, 非0=失败
+    int load(const std::string& parampath, const std::string& modelpath);
+
+    // 图像超分辨率处理
+    // inimage: 输入图像 (ncnn::Mat, 像素格式 RGB, 类型 PIXEL)
+    // outimage: 输出图像 (ncnn::Mat, 自动分配)
+    // 返回: 0=成功, 非0=失败
+    int process(const ncnn::Mat& inimage, ncnn::Mat& outimage) const;
+
+public:
+    int scale;       // 上采样倍数 (2/3/4)
+    int tilesize;    // 分块大小 (0=自动)
+    int prepadding;  // 预填充像素数
+};
+```
+
+**关键公共属性**:
+
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `scale` | int | 上采样倍数，支持 2/3/4 |
+| `tilesize` | int | 分块大小，0 表示自动选择，减小此值可降低显存占用 |
+| `prepadding` | int | 预填充像素，避免边界伪影 |
+
+### 9.3 C++ 图像推理完整示例
+
+以下是使用 Real-ESRGAN C++ API 进行图像超分辨率的完整示例：
+
+```cpp
+#include <stdio.h>
+#include "gpu.h"
+#include "realesrgan.h"
+
+// 使用 stb_image 进行图像读写
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
+int main(int argc, char** argv)
+{
+    const char* input_path = "input.jpg";
+    const char* output_path = "output.png";
+    const char* param_path = "models/realesrgan-x4plus.param";
+    const char* model_path = "models/realesrgan-x4plus.bin";
+    int scale = 4;
+
+    // =============================================
+    // 第1步: 初始化 Vulkan GPU 环境
+    // =============================================
+    ncnn::create_gpu_instance();
+
+    // =============================================
+    // 第2步: 创建 RealESRGAN 实例
+    // =============================================
+    int gpuid = ncnn::get_default_gpu_index();
+    bool tta_mode = false;
+    RealESRGAN realesrgan(gpuid, tta_mode);
+
+    // 设置参数
+    realesrgan.scale = scale;
+    realesrgan.tilesize = 0;     // 0=自动, 设为具体值可控制显存
+    realesrgan.prepadding = 10;  // 预填充像素
+
+    // =============================================
+    // 第3步: 加载 NCNN 模型
+    // =============================================
+    int ret = realesrgan.load(param_path, model_path);
+    if (ret != 0) {
+        fprintf(stderr, "模型加载失败! 返回码: %d\n", ret);
+        ncnn::destroy_gpu_instance();
+        return -1;
+    }
+
+    // =============================================
+    // 第4步: 读取输入图像
+    // =============================================
+    int width, height, channels;
+    unsigned char* pixeldata = stbi_load(input_path, &width, &height, &channels, 3);
+    if (!pixeldata) {
+        fprintf(stderr, "无法读取图像: %s\n", input_path);
+        ncnn::destroy_gpu_instance();
+        return -1;
+    }
+
+    // 创建 ncnn::Mat (从像素数据, RGB格式)
+    ncnn::Mat inimage = ncnn::Mat::from_pixels(pixeldata, ncnn::Mat::PIXEL_RGB,
+                                                width, height);
+
+    // =============================================
+    // 第5步: 执行超分辨率推理
+    // =============================================
+    ncnn::Mat outimage;
+    ret = realesrgan.process(inimage, outimage);
+    if (ret != 0) {
+        fprintf(stderr, "推理失败! 返回码: %d\n", ret);
+        stbi_image_free(pixeldata);
+        ncnn::destroy_gpu_instance();
+        return -1;
+    }
+
+    // =============================================
+    // 第6步: 保存输出图像
+    // =============================================
+    int out_w = outimage.w;
+    int out_h = outimage.h;
+
+    // 将 ncnn::Mat 转为像素数据
+    unsigned char* outpixeldata = new unsigned char[out_w * out_h * 3];
+    outimage.to_pixels(outpixeldata, ncnn::Mat::PIXEL_RGB);
+
+    // 写入 PNG 文件
+    stbi_write_png(output_path, out_w, out_h, 3, outpixeldata, 0);
+    printf("超分辨率完成: %dx%d → %dx%d\n", width, height, out_w, out_h);
+    printf("输出已保存至: %s\n", output_path);
+
+    // =============================================
+    // 第7步: 清理资源
+    // =============================================
+    delete[] outpixeldata;
+    stbi_image_free(pixeldata);
+    ncnn::destroy_gpu_instance();
+
+    return 0;
+}
+```
+
+### 9.4 编译与构建
+
+**前置依赖**: CMake ≥ 3.9, Vulkan SDK, C++17 编译器
+
+```bash
+# 克隆仓库 (含NCNN子模块)
+git clone https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan.git
+cd Real-ESRGAN-ncnn-vulkan
+git submodule update --init --recursive
+
+# 构建
+mkdir build && cd build
+cmake ../src
+cmake --build . -j$(nproc)
+```
+
+**模型转换** (PyTorch → NCNN):
+
+```bash
+# 第1步: PyTorch → ONNX
+python scripts/pytorch2onnx.py --input RealESRGAN_x4plus.pth --output realesrgan-x4.onnx
+
+# 第2步: ONNX → NCNN
+onnx2ncnn realesrgan-x4.onnx realesrgan-x4-raw.param realesrgan-x4-raw.bin
+
+# 第3步: 优化 NCNN 模型 (FP16)
+ncnnoptimize realesrgan-x4-raw.param realesrgan-x4-raw.bin \
+    realesrgan-x4.param realesrgan-x4.bin 1
+```
+
+### 9.5 命令行工具使用
+
+编译完成后可直接使用命令行工具：
+
+```bash
+# 基本用法: 4x 超分辨率
+./realesrgan-ncnn-vulkan -i input.jpg -o output.png -n realesrgan-x4plus
+
+# 指定上采样倍数
+./realesrgan-ncnn-vulkan -i input.jpg -o output.png -n realesr-animevideov3 -s 2
+
+# 批量处理整个目录
+./realesrgan-ncnn-vulkan -i input_folder/ -o output_folder/ -n realesrgan-x4plus
+
+# 使用特定GPU, 自定义分块大小和线程数
+./realesrgan-ncnn-vulkan -i input.jpg -o output.png \
+    -g 0 -t 128 -j 2:4:2 -n realesrgan-x4plus
+
+# 多GPU并行处理
+./realesrgan-ncnn-vulkan -i input.jpg -o output.png \
+    -g 0,1,2 -t 128,128,128 -j 2:4,4,4:2
+
+# 启用 TTA 模式 (更高质量, 8x 推理时间)
+./realesrgan-ncnn-vulkan -i input.jpg -o output.png -x -n realesrgan-x4plus
+```
+
+**命令行参数详解**:
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `-i` | 输入图像路径或目录 | 必填 |
+| `-o` | 输出图像路径或目录 | 必填 |
+| `-s` | 上采样倍数 (2/3/4) | 4 |
+| `-t` | 分块大小 (≥32, 0=自动) | 0 |
+| `-m` | 模型文件夹路径 | `models` |
+| `-n` | 模型名称 | `realesr-animevideov3` |
+| `-g` | GPU设备ID (支持多GPU) | auto |
+| `-j` | 线程数 load:proc:save | `1:2:2` |
+| `-x` | 启用TTA模式 | 关闭 |
+| `-f` | 输出格式 (jpg/png/webp) | ext/png |
+
+**支持的模型**:
+
+| 模型名称 | 说明 |
+|----------|------|
+| `realesrgan-x4plus` | 通用图像 4x 超分 (默认) |
+| `realesrnet-x4plus` | 通用图像 4x (无GAN) |
+| `realesrgan-x4plus-anime` | 动漫图像优化 |
+| `realesr-animevideov3` | 动漫视频优化 (轻量快速) |
+
+---
+
+## 10. Java/Android API 详解 (NCNN-Android)
+
+### 10.1 概述与架构
+
+社区项目 [RealSR-NCNN-Android](https://github.com/tumuyan/RealSR-NCNN-Android) 将 Real-ESRGAN 的 NCNN C++ 实现封装为 Android 应用，通过 JNI（Java Native Interface）桥接 Java/Kotlin 层与 C++ 推理层。
+
+**Android 实现的技术架构**:
+
+```
+┌────────────────────────────────────────────┐
+│     Java/Kotlin 层 (Android UI)             │
+│     ├── Activity / Fragment                 │
+│     ├── Bitmap 图像对象                      │
+│     └── 调用 JNI native 方法                 │
+├────────────────────────────────────────────┤
+│     JNI 桥接层 (C/C++)                      │
+│     ├── Java_..._RealESRGAN_process()       │
+│     ├── Bitmap ↔ ncnn::Mat 转换             │
+│     └── 生命周期管理 (init/process/destroy)  │
+├────────────────────────────────────────────┤
+│     NCNN C++ 推理层                         │
+│     ├── RealESRGAN 类                       │
+│     ├── 分块推理 + Vulkan GPU 加速           │
+│     └── .param + .bin 模型文件              │
+├────────────────────────────────────────────┤
+│     Android 平台层                          │
+│     ├── Vulkan GPU 驱动                     │
+│     └── NDK / CMake 构建系统                 │
+└────────────────────────────────────────────┘
+```
+
+### 10.2 JNI 桥接层
+
+Android 端通过 JNI 将 C++ 的 `RealESRGAN` 类暴露给 Java 层。典型的 JNI 接口设计如下：
+
+```java
+public class RealESRGAN {
+    // 加载 native 库
+    static {
+        System.loadLibrary("realesrgan-ncnn-vulkan");
+    }
+
+    // Native 方法声明
+    // 初始化模型
+    // modelDir: 模型文件目录 (包含 .param 和 .bin 文件)
+    // modelName: 模型名称 (如 "realesrgan-x4plus")
+    // gpuId: GPU设备ID (-1=CPU)
+    // scale: 上采样倍数
+    // tileSize: 分块大小 (0=自动)
+    public native boolean init(String modelDir, String modelName,
+                               int gpuId, int scale, int tileSize);
+
+    // 执行超分辨率处理
+    // inputBitmap: 输入 Android Bitmap
+    // 返回: 超分辨率后的 Bitmap
+    public native Bitmap process(Bitmap inputBitmap);
+
+    // 释放资源
+    public native void destroy();
+}
+```
+
+**对应的 C++ JNI 实现** (`realesrgan_jni.cpp`):
+
+```cpp
+#include <jni.h>
+#include <android/bitmap.h>
+#include "realesrgan.h"
+#include "gpu.h"
+
+static RealESRGAN* realesrgan = nullptr;
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_com_example_realesrgan_RealESRGAN_init(
+    JNIEnv* env, jobject thiz,
+    jstring modelDir, jstring modelName,
+    jint gpuId, jint scale, jint tileSize)
+{
+    const char* model_dir = env->GetStringUTFChars(modelDir, nullptr);
+    const char* model_name = env->GetStringUTFChars(modelName, nullptr);
+
+    // 初始化 Vulkan GPU
+    ncnn::create_gpu_instance();
+
+    // 创建 RealESRGAN 实例
+    realesrgan = new RealESRGAN(gpuId, false);
+    realesrgan->scale = scale;
+    realesrgan->tilesize = tileSize;
+    realesrgan->prepadding = 10;
+
+    // 构建模型路径并加载
+    std::string param_path = std::string(model_dir) + "/" + model_name + ".param";
+    std::string bin_path = std::string(model_dir) + "/" + model_name + ".bin";
+    int ret = realesrgan->load(param_path, bin_path);
+
+    env->ReleaseStringUTFChars(modelDir, model_dir);
+    env->ReleaseStringUTFChars(modelName, model_name);
+
+    return ret == 0;
+}
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_com_example_realesrgan_RealESRGAN_process(
+    JNIEnv* env, jobject thiz, jobject inputBitmap)
+{
+    // 获取输入 Bitmap 信息
+    AndroidBitmapInfo info;
+    AndroidBitmap_getInfo(env, inputBitmap, &info);
+
+    // 锁定像素数据
+    void* pixels;
+    AndroidBitmap_lockPixels(env, inputBitmap, &pixels);
+
+    // 转换为 ncnn::Mat (RGBA → RGB)
+    ncnn::Mat inimage = ncnn::Mat::from_pixels(
+        (const unsigned char*)pixels,
+        ncnn::Mat::PIXEL_RGBA2RGB,
+        info.width, info.height);
+
+    AndroidBitmap_unlockPixels(env, inputBitmap);
+
+    // 执行超分辨率推理
+    ncnn::Mat outimage;
+    realesrgan->process(inimage, outimage);
+
+    // 创建输出 Bitmap
+    jclass bitmapClass = env->FindClass("android/graphics/Bitmap");
+    jmethodID createBitmap = env->GetStaticMethodID(bitmapClass, "createBitmap",
+        "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;");
+    jclass configClass = env->FindClass("android/graphics/Bitmap$Config");
+    jfieldID argb8888 = env->GetStaticFieldID(configClass, "ARGB_8888",
+        "Landroid/graphics/Bitmap$Config;");
+    jobject config = env->GetStaticObjectField(configClass, argb8888);
+
+    jobject outputBitmap = env->CallStaticObjectMethod(bitmapClass, createBitmap,
+        outimage.w, outimage.h, config);
+
+    // 写入像素数据
+    void* outPixels;
+    AndroidBitmap_lockPixels(env, outputBitmap, &outPixels);
+    outimage.to_pixels((unsigned char*)outPixels, ncnn::Mat::PIXEL_RGB2RGBA);
+    AndroidBitmap_unlockPixels(env, outputBitmap);
+
+    return outputBitmap;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_example_realesrgan_RealESRGAN_destroy(JNIEnv* env, jobject thiz)
+{
+    delete realesrgan;
+    realesrgan = nullptr;
+    ncnn::destroy_gpu_instance();
+}
+```
+
+### 10.3 Java/Android 图像推理完整示例
+
+以下是在 Android Activity 中使用 Real-ESRGAN 进行图像超分辨率的完整示例：
+
+```java
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.os.AsyncTask;
+import android.widget.ImageView;
+
+public class SuperResolutionActivity extends Activity {
+
+    private RealESRGAN realesrgan;
+    private ImageView imageView;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+        imageView = findViewById(R.id.imageView);
+
+        // =============================================
+        // 第1步: 初始化 RealESRGAN
+        // =============================================
+        realesrgan = new RealESRGAN();
+
+        // 将模型文件从 assets 复制到应用内部存储
+        String modelDir = getFilesDir().getAbsolutePath() + "/models";
+        copyAssetsToDir("models", modelDir);
+
+        // 初始化模型
+        boolean success = realesrgan.init(
+            modelDir,                      // 模型目录
+            "realesrgan-x4plus",           // 模型名称
+            0,                             // GPU ID (0=默认GPU)
+            4,                             // 上采样倍数
+            0                              // 分块大小 (0=自动)
+        );
+
+        if (!success) {
+            Log.e("RealESRGAN", "模型初始化失败!");
+            return;
+        }
+
+        // =============================================
+        // 第2步: 加载输入图像
+        // =============================================
+        Bitmap inputBitmap = BitmapFactory.decodeResource(
+            getResources(), R.drawable.input_image);
+
+        // =============================================
+        // 第3步: 在后台线程执行超分辨率 (避免阻塞UI)
+        // =============================================
+        new AsyncTask<Bitmap, Void, Bitmap>() {
+            @Override
+            protected Bitmap doInBackground(Bitmap... bitmaps) {
+                // 执行超分辨率推理
+                return realesrgan.process(bitmaps[0]);
+            }
+
+            @Override
+            protected void onPostExecute(Bitmap result) {
+                // 在UI线程显示结果
+                if (result != null) {
+                    imageView.setImageBitmap(result);
+                    Log.i("RealESRGAN", String.format(
+                        "超分完成: %dx%d → %dx%d",
+                        inputBitmap.getWidth(), inputBitmap.getHeight(),
+                        result.getWidth(), result.getHeight()));
+                }
+            }
+        }.execute(inputBitmap);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        // =============================================
+        // 第4步: 释放资源
+        // =============================================
+        if (realesrgan != null) {
+            realesrgan.destroy();
+        }
+    }
+}
+```
+
+### 10.4 Android 项目集成指南
+
+**1. Gradle 构建配置** (`app/build.gradle`):
+
+```groovy
+android {
+    defaultConfig {
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a'  // 支持的CPU架构
+        }
+        externalNativeBuild {
+            cmake {
+                arguments '-DNCNN_VULKAN=ON'         // 启用Vulkan加速
+            }
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path 'src/main/jni/CMakeLists.txt'
+        }
+    }
+}
+```
+
+**2. CMakeLists.txt** (`app/src/main/jni/CMakeLists.txt`):
+
+```cmake
+cmake_minimum_required(VERSION 3.10)
+project(realesrgan-ncnn-vulkan)
+
+# NCNN 预编译库
+set(ncnn_DIR ${CMAKE_SOURCE_DIR}/ncnn/${ANDROID_ABI}/lib/cmake/ncnn)
+find_package(ncnn REQUIRED)
+
+# 编译 Real-ESRGAN JNI 库
+add_library(realesrgan-ncnn-vulkan SHARED
+    realesrgan_jni.cpp
+    realesrgan.cpp
+)
+
+target_link_libraries(realesrgan-ncnn-vulkan
+    ncnn
+    android
+    jnigraphics    # Android Bitmap JNI
+    vulkan
+    log
+)
+```
+
+**3. 模型文件放置**:
+
+将 NCNN 模型文件放入 `app/src/main/assets/models/` 目录：
+```
+assets/
+└── models/
+    ├── realesrgan-x4plus.param     # 模型结构
+    └── realesrgan-x4plus.bin       # 模型权重
+```
+
+---
+
+## 11. ONNX 导出与跨平台部署
+
+Real-ESRGAN 通过 ONNX 格式实现从 Python/PyTorch 到 C++/移动端的模型迁移：
+
+**转换流程**:
+
+```
+PyTorch (.pth)  →  ONNX (.onnx)  →  NCNN (.param + .bin)
+                                  →  TensorRT (.engine)
+                                  →  CoreML (.mlmodel)
+                                  →  其他推理框架
+```
+
+**ONNX 导出脚本** (`scripts/pytorch2onnx.py`):
+
+```python
+import torch
+from basicsr.archs.rrdbnet_arch import RRDBNet
+
+# 创建模型并加载权重
+model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                num_block=23, num_grow_ch=32, scale=4)
+model.load_state_dict(torch.load('RealESRGAN_x4plus.pth')['params_ema'])
+model.eval()
+
+# 导出 ONNX
+x = torch.rand(1, 3, 64, 64)
+with torch.no_grad():
+    torch.onnx.export(model, x, 'realesrgan-x4.onnx',
+                      opset_version=11, export_params=True)
+```
+
+**完整的跨平台部署路径**:
+
+| 目标平台 | 推理框架 | 模型格式 | 仓库/工具 |
+|----------|----------|----------|-----------|
+| Windows/Linux/macOS (GPU) | NCNN + Vulkan | `.param` + `.bin` | [Real-ESRGAN-ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan) |
+| Android (GPU) | NCNN + Vulkan | `.param` + `.bin` | [RealSR-NCNN-Android](https://github.com/tumuyan/RealSR-NCNN-Android) |
+| 通用 (GPU) | ONNX Runtime | `.onnx` | `scripts/pytorch2onnx.py` |
+| NVIDIA GPU | TensorRT | `.engine` | ONNX → TensorRT |
+| Apple 设备 | CoreML | `.mlmodel` | ONNX → CoreML |
+
+---
+
+## 12. 调用流程图
+
+### 12.1 推理调用流程
 
 ```
 用户命令: python inference_realesrgan.py -i input.jpg -s 4
@@ -937,7 +1563,7 @@ python -m realesrgan.train -opt options/train_realesrgan_x4plus.yml \
     └── 完成
 ```
 
-### 9.2 训练调用流程
+### 12.2 训练调用流程
 
 ```
 用户命令: python -m realesrgan.train -opt options/train_realesrgan_x4plus.yml
@@ -992,9 +1618,9 @@ python -m realesrgan.train -opt options/train_realesrgan_x4plus.yml \
 
 ---
 
-## 10. 关键设计模式与工程决策
+## 13. 关键设计模式与工程决策
 
-### 10.1 注册机制 (Registry Pattern)
+### 13.1 注册机制 (Registry Pattern)
 
 通过 BasicSR 的注册机制实现组件的松耦合：
 
@@ -1011,7 +1637,7 @@ class MyNewArch(nn.Module): ...
 
 **优势**: 添加新组件无需修改任何现有代码，只需创建文件并注册。
 
-### 10.2 在线退化合成 (Online Degradation Synthesis)
+### 13.2 在线退化合成 (Online Degradation Synthesis)
 
 退化图像在训练时在线生成，而非预先准备：
 
@@ -1021,7 +1647,7 @@ class MyNewArch(nn.Module): ...
 - 退化参数可随时调整
 - 队列机制进一步增加多样性
 
-### 10.3 分块推理 (Tile-based Inference)
+### 13.3 分块推理 (Tile-based Inference)
 
 对于大图像，分块处理避免 GPU 显存溢出：
 
@@ -1039,7 +1665,7 @@ class MyNewArch(nn.Module): ...
 
 每块独立处理后加权融合边界区域，消除接缝。
 
-### 10.4 深度网络插值 (Deep Network Interpolation, DNI)
+### 13.4 深度网络插值 (Deep Network Interpolation, DNI)
 
 通过混合两个模型的权重实现连续可调的效果：
 
@@ -1051,7 +1677,7 @@ for k in net_a.keys():
 
 应用场景: `realesr-general-x4v3` 模型的降噪强度控制。
 
-### 10.5 生产者-消费者模式 (Producer-Consumer Pattern)
+### 13.5 生产者-消费者模式 (Producer-Consumer Pattern)
 
 视频推理中使用多线程流水线：
 
@@ -1065,7 +1691,7 @@ IOConsumer (消费者线程)
 
 三个阶段并行执行，最大化吞吐量。
 
-### 10.6 两阶段训练策略
+### 13.6 两阶段训练策略
 
 ```
 阶段一 (PSNR导向):
@@ -1079,7 +1705,7 @@ IOConsumer (消费者线程)
 
 ---
 
-## 11. 预训练模型一览
+## 14. 预训练模型一览
 
 | 模型名称 | 架构 | 倍数 | 参数量 | 用途 |
 |----------|------|------|--------|------|
@@ -1092,11 +1718,11 @@ IOConsumer (消费者线程)
 
 ---
 
-## 12. 测试体系
+## 15. 测试体系
 
 项目包含 4 个测试文件，覆盖核心功能：
 
-### 12.1 test_dataset.py
+### 15.1 test_dataset.py
 
 - **`test_realesrgan_dataset()`**: 测试在线退化数据集
   - 验证磁盘和 LMDB 后端
@@ -1109,13 +1735,13 @@ IOConsumer (消费者线程)
   - 检查归一化参数
   - 验证输出形状 (gt: 3×128×128, lq: 3×32×32)
 
-### 12.2 test_discriminator_arch.py
+### 15.2 test_discriminator_arch.py
 
 - **`test_unetdiscriminatorsn()`**: 测试判别器
   - CPU 和 GPU 前向传播
   - 输入 (1,3,32,32) → 输出 (1,1,32,32)
 
-### 12.3 test_model.py
+### 15.3 test_model.py
 
 - **`test_realesrnet_model()`**: 测试回归模型
   - 验证组件类型 (RRDBNet, L1Loss, Adam)
@@ -1126,7 +1752,7 @@ IOConsumer (消费者线程)
   - 验证 3 种损失类型
   - 测试 optimize_parameters() 输出
 
-### 12.4 test_utils.py
+### 15.4 test_utils.py
 
 - **`test_realesrganer()`**: 测试推理引擎
   - 测试 pre_process, tile_process, enhance
@@ -1135,7 +1761,7 @@ IOConsumer (消费者线程)
 
 ---
 
-## 13. 总结
+## 16. 总结
 
 ### 架构优势
 
