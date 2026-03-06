@@ -1234,7 +1234,7 @@ public class RealESRGAN {
 #include "realesrgan.h"
 #include "gpu.h"
 
-static RealESRGAN* realesrgan = nullptr;
+static RealESRGAN* realesrgan = nullptr;  // 注意: 简化示例, 生产环境应使用线程安全的实例管理
 
 extern "C"
 JNIEXPORT jboolean JNICALL
@@ -1327,9 +1327,12 @@ Java_com_example_realesrgan_RealESRGAN_destroy(JNIEnv* env, jobject thiz)
 以下是在 Android Activity 中使用 Real-ESRGAN 进行图像超分辨率的完整示例：
 
 ```java
+import android.app.Activity;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.os.AsyncTask;
+import android.os.Bundle;
+import android.util.Log;
 import android.widget.ImageView;
 
 public class SuperResolutionActivity extends Activity {
