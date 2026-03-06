@@ -1771,10 +1771,24 @@ public:
 
 // === 使用示例 ===
 int main(int argc, char* argv[]) {
+    // 解析命令行参数
+    std::string input_path, output_path;
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "-i" && i + 1 < argc) input_path = argv[++i];
+        else if (arg == "-o" && i + 1 < argc) output_path = argv[++i];
+    }
+    if (input_path.empty()) {
+        std::cerr << "用法: realesrgan-ov -i <输入图像> [-o <输出图像>]"
+                  << std::endl;
+        return 1;
+    }
+    if (output_path.empty()) output_path = "output_openvino.png";
+
     // 读取输入图像
-    cv::Mat img = cv::imread("input.jpg");
+    cv::Mat img = cv::imread(input_path);
     if (img.empty()) {
-        std::cerr << "无法读取图像!" << std::endl;
+        std::cerr << "无法读取图像: " << input_path << std::endl;
         return 1;
     }
 
@@ -1785,7 +1799,7 @@ int main(int argc, char* argv[]) {
     cv::Mat result = upscaler.enhance(img);
 
     // 保存结果
-    cv::imwrite("output_openvino.png", result);
+    cv::imwrite(output_path, result);
     std::cout << "超分完成: " << img.size() << " → "
               << result.size() << std::endl;
     return 0;
